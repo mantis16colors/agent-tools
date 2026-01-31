@@ -22,6 +22,10 @@ usage() {
     echo "  remove <type> <name>    - Remove credential"
     echo "  export                  - Export wallet (encrypted)"
     echo "  import <file>           - Import wallet"
+    echo "  generate-keypair        - Generate signing keypair for attestations"
+    echo "  sign <data>             - Sign data with wallet's private key"
+    echo "  verify <sig> <data>     - Verify a signature"
+    echo "  pubkey                  - Show public verification key"
     echo ""
     echo "Types: did, vc, apikey, ssh, other"
     echo ""
@@ -29,6 +33,7 @@ usage() {
     echo "  echo 'sk_live_xxx' | agent-wallet.sh add apikey stripe"
     echo "  agent-wallet.sh get apikey stripe"
     echo "  agent-wallet.sh list did"
+    echo "  echo 'important data' | agent-wallet.sh sign"
     exit 1
 }
 
@@ -132,6 +137,112 @@ import_wallet() {
     fi
 }
 
+# Attestation functions for agent-to-agent signing
+KEYPAIR_FILE="${WALLET_DIR}/attestation_keypair"
+
+generate_keypair() {
+    [ ! -f "$WALLET_FILE" ] && { echo "No wallet found. Run: agent-wallet.sh init"; exit 1; }
+    
+    if [ -f "$KEYPAIR_FILE" ]; then
+        echo "Keypair already exists at ${KEYPAIR_FILE}"
+        echo "Use: agent-wallet.sh pubkey"
+        return 1
+    fi
+    
+    if command -v openssl &> /dev/null; then
+        # Generate ED25519 keypair using OpenSSL
+        openssl genpkey -algorithm ED25519 -out "${KEYPAIR_FILE}.priv" 2>/dev/null
+        openssl pkey -in "${KEYPAIR_FILE}.priv" -pubout -out "${KEYPAIR_FILE}.pub" 2>/dev/null
+        
+        chmod 600 "${KEYPAIR_FILE}.priv"
+        chmod 644 "${KEYPAIR_FILE}.pub"
+        
+        # Store public key reference in wallet
+        local pubkey=$(cat "${KEYPAIR_FILE}.pub")
+        local tmp=$(mktemp)
+        jq --arg pubkey "$pubkey" '.meta.attestationPublicKey = $pubkey' "$WALLET_FILE" > "$tmp" && mv "$tmp" "$WALLET_FILE"
+        chmod 600 "$WALLET_FILE"
+        
+        echo "✓ Generated ED25519 attestation keypair"
+        echo "  Private: ${KEYPAIR_FILE}.priv"
+        echo "  Public:  ${KEYPAIR_FILE}.pub"
+    else
+        echo "OpenSSL required for attestation features"
+        exit 1
+    fi
+}
+
+sign_data() {
+    [ ! -f "$WALLET_FILE" ] && { echo "No wallet found. Run: agent-wallet.sh init"; exit 1; }
+    [ ! -f "${KEYPAIR_FILE}.priv" ] && { echo "No attestation keypair. Run: agent-wallet.sh generate-keypair"; exit 1; }
+    
+    local data="$1"
+    local timestamp=$(date -Iseconds)
+    local payload="${data}|${timestamp}"
+    
+    if command -v openssl &> /dev/null; then
+        # Sign the payload
+        local signature=$(echo -n "$payload" | openssl pkeyutl -sign -inkey "${KEYPAIR_FILE}.priv" | base64 -w 0)
+        
+        # Output as JSON for easy parsing
+        jq -n \
+            --arg data "$data" \
+            --arg timestamp "$timestamp" \
+            --arg signature "$signature" \
+            --arg pubkey "$(cat "${KEYPAIR_FILE}.pub")" \
+            '{data: $data, timestamp: $timestamp, signature: $signature, publicKey: $pubkey}'
+    else
+        echo "OpenSSL required for signing"
+        exit 1
+    fi
+}
+
+verify_signature() {
+    local signature="$1"
+    local data="$2"
+    local pubkey="$3"
+    
+    if [ -z "$pubkey" ]; then
+        pubkey="${KEYPAIR_FILE}.pub"
+    fi
+    
+    if command -v openssl &> /dev/null; then
+        # Parse signature (expected JSON format with timestamp)
+        local sig_data=$(echo "$signature" | jq -r '.signature // empty')
+        local timestamp=$(echo "$signature" | jq -r '.timestamp // empty')
+        local payload="${data}|${timestamp}"
+        
+        if [ -z "$sig_data" ] || [ -z "$timestamp" ]; then
+            echo "❌ Invalid signature format"
+            return 1
+        fi
+        
+        # Verify
+        echo -n "$payload" | base64 -d > /tmp/sig_verify_$$.bin
+        echo "$sig_data" | base64 -d >> /tmp/sig_verify_$$.bin
+        
+        if openssl pkeyutl -verify -pubin -inkey "$pubkey" -certin -in /tmp/sig_verify_$$.bin 2>/dev/null; then
+            echo "✓ Signature valid"
+            rm -f /tmp/sig_verify_$$.bin
+            return 0
+        else
+            echo "❌ Signature invalid"
+            rm -f /tmp/sig_verify_$$.bin
+            return 1
+        fi
+    else
+        echo "OpenSSL required for verification"
+        exit 1
+    fi
+}
+
+show_pubkey() {
+    [ ! -f "${KEYPAIR_FILE}.pub" ] && { echo "No attestation keypair. Run: agent-wallet.sh generate-keypair"; exit 1; }
+    
+    echo "=== Public Verification Key ==="
+    cat "${KEYPAIR_FILE}.pub"
+}
+
 case "$1" in
     init) init_wallet ;;
     add) [ -z "$2" ] || [ -z "$3" ] && usage; add_credential "$2" "$3" ;;
@@ -140,5 +251,9 @@ case "$1" in
     remove|rm) [ -z "$2" ] || [ -z "$3" ] && usage; remove_credential "$2" "$3" ;;
     export) export_wallet ;;
     import) [ -z "$2" ] && usage; import_wallet "$2" ;;
+    generate-keypair) generate_keypair ;;
+    sign) [ -z "$2" ] && usage; sign_data "$2" ;;
+    verify) [ -z "$2" ] || [ -z "$3" ] && usage; verify_signature "$2" "$3" "$4" ;;
+    pubkey) show_pubkey ;;
     *) usage ;;
 esac
